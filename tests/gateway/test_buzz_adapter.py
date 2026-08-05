@@ -29,6 +29,7 @@ _standalone_send = _buzz_mod._standalone_send
 SELF_PUBKEY = "9fd5c7ba6d3ef224da78f541e0fcb9c50f72cc63edb19aae76ac6a0474dfa860"
 SELF_NPUB = "npub1nl2u0wnd8mezfknc74q7pl9ec58h9nrrakce4tnk434qgaxl4psqe5twr6"
 OTHER_PUBKEY = "a" * 64
+OWNER_PUBKEY = "b" * 64
 CHANNEL = "ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd"
 # Real DM conversation as materialized by a hosted relay: `dms list` returns
 # [] for it (#68871) while `channels list` shows it as name "DM", empty
@@ -45,6 +46,7 @@ _ENV_VARS = (
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
+    "BUZZ_AUTH_TAG",
 )
 
 
@@ -216,7 +218,7 @@ class TestMentionGating:
 
     @pytest.fixture
     def adapter(self):
-        a = _make_adapter()
+        a = _make_adapter(extra={"owner_pubkey": OWNER_PUBKEY})
         a._dispatched = []
 
         async def capture(**kwargs):
@@ -242,6 +244,56 @@ class TestMentionGating:
     async def test_name_mention_dispatched(self, adapter):
         await self._poll_with(adapter, _event("e1", content="hey @Chip can you help?", created_at=10))
         assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_owner_message_without_mention_dispatched(self):
+        adapter = _make_adapter(extra={"owner_pubkey": OWNER_PUBKEY})
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+
+        await self._poll_with(
+            adapter,
+            _event("e1", pubkey=OWNER_PUBKEY, content="please check this", created_at=10),
+        )
+
+        assert [message["message_id"] for message in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
+    async def test_attested_owner_message_without_mention_dispatched(self, monkeypatch):
+        monkeypatch.setenv(
+            "BUZZ_AUTH_TAG",
+            json.dumps(["auth", OWNER_PUBKEY, "kind=9", "c" * 128]),
+        )
+        adapter = _make_adapter()
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group",
+            "last_ts": 0,
+            "seen": {},
+        }
+
+        await self._poll_with(
+            adapter,
+            _event("e1", pubkey=OWNER_PUBKEY, content="please check this", created_at=10),
+        )
+
+        assert [message["message_id"] for message in adapter._dispatched] == ["e1"]
 
 
     @pytest.mark.asyncio
@@ -451,7 +503,9 @@ class TestBuzzAdapterLifecycle:
         import gateway.status as gateway_status
 
         monkeypatch.setattr(
-            gateway_status, "acquire_scoped_lock", lambda platform, key: False
+            gateway_status,
+            "acquire_scoped_lock",
+            lambda platform, key: (False, {"pid": 4242}),
         )
         adapter = _make_adapter()
         adapter.cli_path = "/fake/buzz"
@@ -536,5 +590,3 @@ class TestStandaloneSend:
         assert captured["input_text"] == "cron says hi"
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
-
-

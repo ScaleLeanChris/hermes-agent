@@ -24,6 +24,7 @@ Configuration in config.yaml::
             poll_interval: 4           # seconds between poll sweeps
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
+            owner_pubkey: ""            # owner may speak in channels without a mention
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
 
 Or via environment variables (overrides config.yaml):
@@ -225,6 +226,34 @@ def _normalize_user_ref(ref: str) -> Optional[str]:
     return None
 
 
+def _resolve_owner_pubkey(extra: Optional[dict] = None) -> str:
+    """Resolve the routing owner from config or a NIP-OA auth tag.
+
+    The relay and buzz CLI verify the attestation against the agent identity.
+    This helper only extracts its owner field for local mention routing.
+    """
+    configured = _normalize_user_ref(str((extra or {}).get("owner_pubkey", "") or ""))
+    if configured:
+        return configured
+
+    raw_auth_tag = os.getenv("BUZZ_AUTH_TAG", "").strip()
+    if not raw_auth_tag:
+        return ""
+    try:
+        auth_tag = json.loads(raw_auth_tag)
+    except (TypeError, ValueError):
+        return ""
+    if (
+        not isinstance(auth_tag, list)
+        or len(auth_tag) != 4
+        or auth_tag[0] != "auth"
+        or not all(isinstance(part, str) for part in auth_tag)
+        or not re.fullmatch(r"[0-9a-f]{128}", auth_tag[3])
+    ):
+        return ""
+    return _normalize_user_ref(auth_tag[1]) or ""
+
+
 # ---------------------------------------------------------------------------
 # buzz-cli invocation helpers
 # ---------------------------------------------------------------------------
@@ -392,6 +421,11 @@ class BuzzAdapter(BasePlatformAdapter):
             _rm_cfg = _rm_raw
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
 
+        # The owner may address this agent naturally in shared channels.
+        # Other senders still need an explicit mention when require_mention
+        # is enabled. This is routing identity, not an authorization list.
+        self._owner_pubkey = _resolve_owner_pubkey(extra)
+
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
         # or "poll" (CLI polling only). Env (BUZZ_TRANSPORT) overrides
@@ -496,7 +530,8 @@ class BuzzAdapter(BasePlatformAdapter):
             from gateway.status import acquire_scoped_lock
 
             lock_key = f"{self.relay_url}:{self._self_pubkey}"
-            if not acquire_scoped_lock("buzz", lock_key):
+            acquired, _existing_lock = acquire_scoped_lock("buzz", lock_key)
+            if not acquired:
                 logger.error(
                     "Buzz: identity %s… on %s already in use by another profile",
                     self._self_pubkey[:8],
@@ -1033,7 +1068,8 @@ class BuzzAdapter(BasePlatformAdapter):
         # In shared channels, respond only when addressed — unless
         # require_mention is disabled, in which case respond to every message.
         # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
+        is_owner = bool(self._owner_pubkey and pubkey == self._owner_pubkey)
+        if not is_dm and self.require_mention and not is_owner and not self._is_mentioned(content):
             return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
